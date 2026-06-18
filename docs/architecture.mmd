@@ -1,0 +1,37 @@
+%% Source for docs/architecture.png — render with the Mermaid live editor
+%% (https://mermaid.live) or `mmdc -i architecture.mmd -o architecture.png`.
+flowchart TD
+    IN[inbox.json] --> IDX["index.ts<br/>configureTrace · runAgent · buildBatchOutput"]
+    IDX --> POOL{{"bounded concurrency ≈5"}}
+    POOL --> CTX["withItemContext(item.id)"]
+
+    subgraph PIPE["per-item pipeline"]
+      direction TB
+      CTX --> U["Stage 1 · UNDERSTAND (understand.ts)<br/>LLM structured judgement ∥ rules.extractIntake<br/>reconcile: regex wins labeled fields, LLM wins prose + judgement"]
+      U --> SG{"SAFETY GATE (safety.ts)<br/>LLM flag OR keyword net?"}
+      SG -- "either fires" --> P0["force safeguarding · P0"]
+      SG -- "P1 without same-day signal" --> DG["downgrade to P2"]
+      P0 --> ORCH
+      DG --> ORCH
+      SG -- "otherwise" --> ORCH["Stage 2 · ORCHESTRATE (orchestrate.ts)<br/>deterministic — the only place tools fire"]
+
+      ORCH -->|safeguarding| T1["lookup_policy · escalate(P0) · create_task(clinical_lead)"]
+      ORCH -->|"in-network + complete + slot"| T2["search_patient · verify_insurance · find_slots · hold_slot · create_task"]
+      ORCH -->|"OON / expired / unknown"| T3["verify_insurance · lookup_policy · create_task(billing/intake)"]
+      ORCH -->|clinical question| T4["lookup_policy · create_task(intake)"]
+      ORCH -->|missing paperwork| T5["create_task(front_desk) + missing_info[]"]
+      ORCH -->|same-day reschedule| T6["search_patient · create_task(front_desk)"]
+
+      T1 --> CMP
+      T2 --> CMP
+      T3 --> CMP
+      T4 --> CMP
+      T5 --> CMP
+      T6 --> CMP["Stage 3 · COMPOSE (compose.ts)<br/>LLM draft_reply (en/es) + action + rationale<br/>then draft_message — no advice, never implies sent/booked"]
+    end
+
+    CMP --> OUT["assemble ItemOutput<br/>tools_called = getToolCallsForItem(id) verbatim<br/>requires_human_review = true"]
+
+    U -. "no key / LLM error" .-> FB["rules fallback"]
+    CMP -. "no key / LLM error" .-> FT["templated draft"]
+    FB --> ORCH
