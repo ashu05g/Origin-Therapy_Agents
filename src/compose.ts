@@ -46,6 +46,8 @@ Hard rules for draft_reply:
 - Write in the family's language (English or Spanish) as indicated.
 - For a safeguarding item: write ONLY a brief, neutral acknowledgement that the message was received and a team member will follow up. Do NOT mention abuse/harm, do NOT ask investigative questions, do NOT give advice.
 - Reflect the real situation you are given: if insurance is out-of-network or expired, say billing will follow up before scheduling; if information is missing, request exactly those items; if a slot is on pending hold, say a team member will confirm it.
+- If prior authorization is required (coverage is in-network but needs authorization), the draft must say the team will verify benefits and obtain any required authorization BEFORE scheduling, and must NOT imply an appointment time is set or being held. In-network coverage alone does not mean we can schedule yet.
+- IDENTITY/AUTHORIZATION CONCERN (highest priority after safeguarding): if there is a patient-record concern (the requester may not be the authorized guardian, or the record is inactive), write ONLY a brief, neutral acknowledgement that a team member will follow up to confirm a few details before proceeding. Do NOT confirm or deny that any record exists, do NOT reveal coverage/referral/appointment details, and do NOT name any other guardian. This supersedes the insurance/scheduling phrasing above.
 - No signature block, no placeholders like [Name]. 2-5 sentences.
 
 recommended_next_action: one sentence, operational, for staff (who does what next). Agents never book or send.
@@ -123,6 +125,18 @@ function buildContext(
           facts.insuranceNotes ? ` (${facts.insuranceNotes})` : ""
         }`
       : "Insurance verification: not performed",
+    `Prior authorization required: ${
+      facts.authRequired === true
+        ? "yes — must be obtained before scheduling; do not imply an appointment is set"
+        : facts.authRequired === false
+          ? "no"
+          : "n/a"
+    }`,
+    `Identity/authorization concern: ${
+      facts.identityConcern
+        ? "yes — requester may not be the authorized guardian or the record is inactive; draft a neutral verification acknowledgement only, reveal no record details"
+        : "none"
+    }`,
     facts.missingInfo.length
       ? `Missing information: ${facts.missingInfo.join(", ")}`
       : "Missing information: none",
@@ -183,6 +197,13 @@ function templateDraft(u: Understanding, facts: OrchestrationFacts): string | nu
   }
   if (facts.scenario === "spam") return null;
 
+  // Identity concern supersedes other phrasing: neutral, reveals nothing.
+  if (facts.identityConcern) {
+    return es
+      ? "Hola, gracias por su mensaje. Un miembro de nuestro equipo se comunicará con usted para confirmar algunos datos antes de continuar."
+      : "Hi, thank you for your message. A team member will follow up with you to confirm a few details before we proceed.";
+  }
+
   if (u.classification === "clinical_question") {
     return `Hi, thanks for reaching out about ${name}. We're not able to give clinical advice by message, but we'd be glad to set up a screening or evaluation so a clinician can take a proper look. A team member will follow up to arrange the next step.`;
   }
@@ -193,6 +214,9 @@ function templateDraft(u: Understanding, facts: OrchestrationFacts): string | nu
   }
   if (facts.insuranceStatus === "out_of_network" || facts.insuranceStatus === "expired") {
     return `Hi, thank you for ${name}'s referral. Our billing team needs to review the insurance on file before we move forward with scheduling, and will follow up with you about options.`;
+  }
+  if (facts.authRequired === true) {
+    return `Hi, thank you for ${name}'s referral. Your plan is in-network; before we schedule, our team will verify benefits and obtain any required prior authorization, then follow up to arrange the evaluation. Nothing is scheduled yet.`;
   }
   if (facts.held && facts.earliestSlot) {
     return `Hi, thank you for ${name}'s referral. We've tentatively set aside an evaluation time and a team member will follow up to confirm it with you. Nothing is booked yet.`;

@@ -1,4 +1,4 @@
-import type { Assignee, InboxItem, PolicyTopic, Slot } from "./types.js";
+import type { Assignee, InboxItem, Patient, PolicyTopic, Slot } from "./types.js";
 import type { OrchestrationFacts, Understanding } from "./triage-types.js";
 import {
   create_task,
@@ -29,33 +29,56 @@ export async function orchestrate(
     policyTopics: [],
     insuranceStatus: null,
     insuranceNotes: null,
+    authRequired: null,
     earliestSlot: null,
     slotCount: 0,
     held: false,
     patientFound: false,
+    patientStatus: null,
+    identityConcern: null,
     recommendedNextAction: "",
   };
 
+  let result: OrchestrationFacts;
   switch (u.classification) {
     case "safeguarding":
-      return safeguarding(item, u, facts);
+      result = await safeguarding(item, u, facts);
+      break;
     case "clinical_question":
-      return clinicalQuestion(item, u, facts);
+      result = await clinicalQuestion(item, u, facts);
+      break;
     case "missing_paperwork":
-      return missingPaperwork(item, u, facts);
+      result = await missingPaperwork(item, u, facts);
+      break;
     case "scheduling":
     case "existing_patient_request":
-      return scheduling(item, u, facts);
+      result = await scheduling(item, u, facts);
+      break;
     case "new_referral":
-      return newReferral(item, u, facts);
+      result = await newReferral(item, u, facts);
+      break;
     case "spam":
       facts.scenario = "spam";
       facts.recommendedNextAction =
         "No action required; mark as spam/FYI after a quick human glance.";
-      return facts;
+      result = facts;
+      break;
     default:
-      return fallbackOther(item, u, facts);
+      result = await fallbackOther(item, u, facts);
+      break;
   }
+
+  // A patient-record concern (inactive record, or requester ≠ guardian on file)
+  // is the leading next step: verify before acting on the child's record.
+  if (result.identityConcern) {
+    result.recommendedNextAction = `Front desk first confirms the requester is an authorized guardian for ${childLabel(
+      u,
+    )} (and reactivates the record if it is inactive) before acting on this request or sharing any information. Then: ${
+      result.recommendedNextAction
+    }`;
+  }
+
+  return result;
 }
 
 async function safeguarding(
@@ -135,7 +158,8 @@ async function scheduling(
 ): Promise<OrchestrationFacts> {
   facts.scenario = u.same_day_operational ? "same_day_reschedule" : "scheduling";
 
-  facts.patientFound = await tryFindPatient(u);
+  await resolvePatient(item, u, facts);
+  await addIdentityTask(item, u, facts);
 
   const urgency = u.same_day_operational ? "P1" : "P2";
   const task = await create_task({
@@ -163,7 +187,8 @@ async function newReferral(
 ): Promise<OrchestrationFacts> {
   facts.scenario = "new_referral";
   facts.missingInfo = computeMissingInfo(u);
-  facts.patientFound = await tryFindPatient(u);
+  await resolvePatient(item, u, facts);
+  await addIdentityTask(item, u, facts);
 
   const payer = u.extracted_intake.payer;
   if (!payer) {
@@ -186,6 +211,7 @@ async function newReferral(
   });
   facts.insuranceStatus = insurance.data.status;
   facts.insuranceNotes = insurance.data.notes ?? null;
+  facts.authRequired = insurance.data.auth_required ?? null;
 
   if (insurance.data.status === "in_network") {
     return inNetworkReferral(item, u, facts);
@@ -215,8 +241,29 @@ async function inNetworkReferral(
   u: Understanding,
   facts: OrchestrationFacts,
 ): Promise<OrchestrationFacts> {
-  const complete = facts.missingInfo.length === 0;
+  // `in_network` coverage does NOT establish that the service is authorized:
+  // verify_insurance also reports `auth_required`, a hard precondition for
+  // scheduling. If prior authorization is required, pause here — route to obtain
+  // it first and don't even shop for slots (that would presume we're cleared to
+  // schedule).
+  if (facts.authRequired === true) {
+    await recordPolicy(facts, "insurance");
+    const task = await create_task({
+      assignee: "billing",
+      title: `Obtain prior authorization before scheduling: ${childLabel(u)}`,
+      due: dueDate(item, "P2"),
+      notes: `In-network ${disciplineLabel(u)} coverage (${u.extracted_intake.payer}) requires prior authorization. Obtain authorization before any slot is found, held, or scheduled.${
+        facts.patientFound ? " Existing patient record found — dedupe." : ""
+      }`,
+    });
+    facts.taskIds.push(task.data.task_id);
+    facts.recommendedNextAction = `Billing obtains prior authorization from ${u.extracted_intake.payer} for the ${disciplineLabel(
+      u,
+    )} evaluation before any slot is found or scheduled.`;
+    return facts;
+  }
 
+  const complete = facts.missingInfo.length === 0;
   const discipline = u.discipline?.[0];
   const slots = await find_slots({
     discipline,
@@ -226,16 +273,15 @@ async function inNetworkReferral(
   facts.slotCount = slots.data.length;
   facts.earliestSlot = slots.data[0] ?? null;
 
-  // Hold a slot only on the clean path: in-network, complete intake, a slot
-  // matching the requested discipline. But if the family stated a specific
-  // time/day preference, do NOT presume a hold (the earliest slot likely
-  // conflicts) — recommend instead and let staff offer a matching time. A
-  // language preference is already satisfied by provider matching, so it does
-  // not block a hold.
+  // Hold a slot only on the clean path: complete intake, a slot matching the
+  // requested discipline, and no stated time/day preference (we don't presume a
+  // hold against a family's stated availability — a language preference is
+  // satisfied by provider matching, so it does not block).
   const slot = facts.earliestSlot;
   const timePref = hasTimePreference(u);
   const disciplineMatches = slot && (!discipline || slot.discipline === discipline);
-  if (complete && slot && disciplineMatches && !timePref) {
+
+  if (complete && slot && disciplineMatches && !timePref && !facts.identityConcern) {
     await hold_slot({ slot_id: slot.slot_id, patient_ref: childLabel(u) });
     facts.held = true;
   }
@@ -312,14 +358,81 @@ async function recordPolicy(
   facts.policyTopics.push(topic);
 }
 
-async function tryFindPatient(u: Understanding): Promise<boolean> {
+/** Look the child up and record what the result establishes — and, crucially,
+ * what it does not. A match proves a record exists, not that it is active or
+ * that the requester is the guardian on file. */
+async function resolvePatient(
+  item: InboxItem,
+  u: Understanding,
+  facts: OrchestrationFacts,
+): Promise<void> {
   const name = u.extracted_intake.child_name;
-  if (!name) return false;
+  if (!name) return;
   const dob = isIsoDate(u.extracted_intake.dob_or_age)
     ? (u.extracted_intake.dob_or_age as string)
     : undefined;
   const result = await search_patient({ name, dob });
-  return result.data.length > 0;
+  const record = result.data[0] ?? null;
+  facts.patientFound = Boolean(record);
+  facts.patientStatus = record?.status ?? null;
+  facts.identityConcern = assessRecord(record, item);
+}
+
+export function assessRecord(record: Patient | null, item: InboxItem): string | null {
+  if (!record) return null;
+  if (record.status === "inactive") {
+    return "The patient record on file is inactive; reactivate and confirm details before acting on this request.";
+  }
+  const requester = requesterName(item);
+  if (
+    requester &&
+    record.guardian_name &&
+    !nameOverlaps(requester, record.guardian_name)
+  ) {
+    return `The name on this message ("${requester}") does not match the guardian on the child's record; confirm the requester is an authorized guardian before acting or sharing any information.`;
+  }
+  return null;
+}
+
+/** Create the leading verification task when the record raises a concern. */
+async function addIdentityTask(
+  item: InboxItem,
+  u: Understanding,
+  facts: OrchestrationFacts,
+): Promise<void> {
+  if (!facts.identityConcern) return;
+  const task = await create_task({
+    assignee: "front_desk",
+    title: `Verify requester authorization: ${childLabel(u)}`,
+    due: dueDate(item, facts.scenario === "same_day_reschedule" ? "P1" : "P2"),
+    notes: facts.identityConcern,
+  });
+  facts.taskIds.push(task.data.task_id);
+}
+
+/** The human name of the person contacting us, when that is a family member
+ * rather than a referring clinic. Fax referrals come from clinics, so there is
+ * no guardian claim to reconcile. */
+function requesterName(item: InboxItem): string | null {
+  if (item.channel === "fax_referral") return null;
+  const cleaned = item.sender
+    .replace(/<[^>]*>/g, "")
+    .replace(/\b(voicemail|voice mail|via parent portal|parent portal|fax|email)\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || null;
+}
+
+/** Share any name token (≥3 chars)? Used to avoid false alarms on legitimate
+ * co-parents who share a surname, while still flagging a wholly different name. */
+function nameOverlaps(a: string, b: string): boolean {
+  const tokens = (s: string) =>
+    new Set((s.toLowerCase().match(/[a-záéíóúñ]{3,}/gi) ?? []).map((t) => t));
+  const left = tokens(a);
+  for (const token of tokens(b)) {
+    if (left.has(token)) return true;
+  }
+  return false;
 }
 
 function computeMissingInfo(u: Understanding): string[] {

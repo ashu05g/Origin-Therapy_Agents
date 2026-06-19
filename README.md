@@ -88,18 +88,43 @@ vigilance.
 | Situation | Tools fired | Notes |
 |---|---|---|
 | Safeguarding (either detector) | `lookup_policy` · `escalate(P0)` · `create_task(clinical_lead)` | Neutral acknowledgement draft only |
-| New referral, in-network, complete intake, matching slot | `search_patient` · `verify_insurance` · `find_slots` · `hold_slot` · `create_task` | The only path that holds a slot (pending review, never booked) |
+| New referral, in-network, **no prior auth**, complete intake, no time preference | `search_patient` · `verify_insurance` · `find_slots` · `hold_slot` · `create_task` | The only path that holds a slot (pending review, never booked) |
+| In-network but **prior authorization required** | `search_patient` · `verify_insurance` · `lookup_policy` · `create_task(billing)` | **Pause:** no slot lookup or hold; obtain authorization first; draft says benefits/auth verified before scheduling |
 | Out-of-network / expired insurance | `verify_insurance` · `lookup_policy` · `create_task(billing)` | No hold; benefits conversation first |
 | Unknown payer | `verify_insurance` · `lookup_policy` · `create_task(intake)` | Manual verification before slots |
-| In-network but incomplete intake | `verify_insurance` · `find_slots` · `create_task` | Hold withheld until missing fields collected |
+| In-network, no auth, but stated time preference or incomplete intake | `verify_insurance` · `find_slots` · `create_task` | Hold withheld; staff offers a matching time / collects missing fields |
 | Clinical question | `lookup_policy` · `create_task(intake)` | Route to screening/eval; give no advice |
 | Missing paperwork | `create_task(front_desk)` | `missing_info[]` populated; draft requests the blanks |
 | Same-day reschedule | `search_patient` · `create_task(front_desk)` | P1; existing patient |
+| Patient record concern (inactive, or requester ≠ guardian on file) | `search_patient` · `create_task(front_desk: verify)` | **Pause:** verify authorization first; no hold; draft reveals no record details |
 | Spanish anywhere | `find_slots(language:'es')` + Spanish draft | Matches a Spanish-capable provider |
 
 All eight tools are exercised across the visible batch; `hold_slot` and
 `escalate` (the strongest actions) fire only on the clean and the safeguarding
 paths respectively.
+
+**Evidence must establish what the action assumes.** A tool result that *looks*
+like a green light isn't necessarily one. `verify_insurance` returning
+`in_network` confirms coverage but **not** that the service is authorized — the
+same result carries `auth_required`. So `in_network` alone never proceeds to a
+hold: if `auth_required` is true the system pauses, routes to billing for prior
+authorization, and the family-facing draft says benefits/authorization will be
+verified *before* scheduling (it never implies a time is set). A slot is held
+only when coverage is in-network **and** authorization is not required **and**
+intake is complete **and** the family stated no conflicting time preference.
+
+The same rigor applies to `search_patient`: a match establishes that a record
+*exists* — not that the patient is *active* or that the person contacting us is
+the *authorized guardian*. So a match never silently proceeds. If the record is
+inactive, or the requester's name doesn't match the guardian on file (e.g.
+item_4: "Carla Mendez" contacting about a record whose guardian is "Sofia
+Ramirez"), the system pauses: it files a front-desk authorization-verification
+task as the leading step, withholds any slot hold, and the family draft becomes
+a neutral acknowledgement that reveals nothing about the record (no coverage,
+referral, or appointment details, no other guardian's name) — protecting against
+disclosing a child's information to a possibly-unauthorized requester. The
+surname check avoids false alarms on legitimate co-parents, and clinic-originated
+fax referrals are exempt (no guardian claim to reconcile).
 
 ---
 

@@ -49,10 +49,22 @@ export interface OrchestrationFacts {
   policyTopics: PolicyTopic[];
   insuranceStatus: InsuranceStatus | null;
   insuranceNotes: string | null;
+  /** From verify_insurance: in-network coverage still requires prior
+   * authorization before scheduling. `in_network` status alone does NOT
+   * establish the service is authorized. */
+  authRequired: boolean | null;
   earliestSlot: Slot | null;
   slotCount: number;
   held: boolean;
   patientFound: boolean;
+  /** Status of the matched patient record, if any. A match establishes a record
+   * exists — not that it is usable. */
+  patientStatus: "active" | "inactive" | null;
+  /** Set when the search_patient result undermines an assumption the downstream
+   * action would make: an inactive record, or a requester whose name does not
+   * match the guardian on file. Drives a pause-and-verify step rather than
+   * proceeding. */
+  identityConcern: string | null;
   /** Deterministic baseline used directly in the no-LLM path and as a hint to
    * the composer. */
   recommendedNextAction: string;
